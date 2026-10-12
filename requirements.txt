@@ -1,0 +1,11 @@
+# Quantum simulation
+qiskit>=1.0.0,<2.0.0
+qiskit-aer>=0.13.0
+numpy>=1.24.0
+
+# Classical + post-quantum crypto
+# (version 50+ ships ML-KEM-768 and ML-DSA-65, NIST FIPS 203/204)
+cryptography>=50.0.0
+
+# Tests
+pytest>=8.0.0
