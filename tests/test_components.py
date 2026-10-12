@@ -35,10 +35,11 @@ def test_cascade_corrects(q):
 
 
 def test_toeplitz_is_deterministic_and_compresses():
+    from crypto.privacy import new_toeplitz_seed
     bits = random_bits(1000)
-    seed = secrets.randbits(128)
-    out = toeplitz_hash(bits, 300, seed)
-    assert out == toeplitz_hash(bits, 300, seed) and len(out) == 300
+    seed = new_toeplitz_seed(1000, 296)
+    out = toeplitz_hash(bits, 296, seed)
+    assert out == toeplitz_hash(bits, 296, seed) and len(out) == 296
 
 
 def test_key_length_shrinks_with_qber():

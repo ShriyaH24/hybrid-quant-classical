@@ -5,7 +5,7 @@ error rate (QBER) and shifts between three security "gears":
 
 | Gear | Suite | When | Security |
 |------|-------|------|----------|
-| **3** | QKD (BB84) + ML-KEM-768 + AES-256-GCM | QBER ≤ 11 % and both nodes have PQC | Information-theoretic + post-quantum |
+| **3** | QKD (BB84) + ML-KEM-768 + AES-256-GCM | QBER ≤ 11 % and both nodes have PQC | Hybrid: secret unless BOTH QKD and ML-KEM are broken |
 | **2** | ML-KEM-768 + ML-DSA-65 + AES-256-GCM | QKD unusable (QBER > 11 %, link down, too little key) | Post-quantum |
 | **1** | X25519 ECDH + AES-256-GCM (Ed25519 auth) | No QKD **and** no PQC | Classical only – documented quantum risk |
 
@@ -63,7 +63,9 @@ signed epoch from that epoch's own QBER sample.
 | channel + alice | `link up` and `/pqc on` | **1 -> 3** |
 | alice | `/status` | gear history with the trigger for every shift |
 
-`/quiet` hides the per-probe lines, `--probe-every 3` probes faster,
+In the channel console, `watch on` shows a line per probe (hidden by default so
+they don't break up your typing); `noise 5` and `noise 5%` both mean 5 %.
+In Alice, `/quiet` hides the per-probe lines, `--probe-every 3` probes faster,
 `--probe-every 0` turns the monitor off (manual `/rekey` only).
 Other knobs: `python bob/bob.py --no-pqc`, and `--min-gear 2` on either
 node to refuse Gear 1 entirely. Alice also rotates keys every 3 messages
@@ -90,6 +92,28 @@ Alice ◀──────────────── classical TCP (signed 
                             (ML-DSA-65, or Ed25519 in Gear 1)
   → HKDF(QKD key ‖ ML-KEM secret  |  ML-KEM secret  |  ECDH secret) = AES-256 key
 ```
+
+### Key schedule (how the gear's secrets become the AES key)
+
+```
+IKM  = "qkd"|len|QKD key  ||  "mlkem768"|len|ML-KEM secret      (Gear 3)
+       "mlkem768"|len|ML-KEM secret                              (Gear 2)
+       "x25519"|len|X25519 secret                                (Gear 1)
+salt = nonce_A || nonce_B
+key_X = HKDF-SHA256(salt, IKM, info = "HCQC-v1|X|gear|epoch|" + transcript hash)
+        X = session key, key confirmation alice, key confirmation bob
+```
+
+* Each secret is labelled and length-prefixed, so they can't be shifted into
+  one another; only the secrets of the negotiated gear are used.
+* Gear, epoch and the hash of every handshake byte are in every label, so the
+  two sides get equal keys **only** after byte-identical handshakes.
+* Each side sends an HMAC over the transcript under its confirmation key
+  (with its signature); a different key means the epoch is aborted.
+* Privacy amplification uses a Toeplitz matrix with **n + l − 1 fresh random
+  bits** from the OS (not a short seed stretched by a PRNG), as the leftover
+  hash lemma requires; the seed is public and covered by the signatures.
+  Final QKD keys are whole bytes, so no padding enters the KDF.
 
 ### Why each piece is there
 
@@ -152,6 +176,8 @@ shifting 3 → 2 → 3 → 1 → 3 with no manual re-key.
 * The quantum channel is simulated; there is no real photon source.
 * The finite-key correction is a normal approximation, not a rigorous
   finite-key proof.
+* After HKDF the session is protected by AES-256-GCM, so message secrecy
+  is computational (quantum-resistant), not information-theoretic.
 * Both identity keys are generated on one machine for the demo; in
   practice each party keeps its own private key.
 * Only Alice sends messages; Bob responds to handshakes.

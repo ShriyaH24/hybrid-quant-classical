@@ -21,6 +21,7 @@ fine for a teaching demo but not a rigorous finite-key proof.
 """
 
 import math
+import os
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -49,22 +50,42 @@ def secret_key_length(n_key: int,
     e_up = qber_upper_bound(qber, n_sample, sigmas)
     length = (n_key * (1 - binary_entropy(e_up))
               - leaked_ec - verify_bits - 2 * math.log2(1 / eps))
-    return max(0, int(math.floor(length))), e_up
+    # whole bytes only, so the key is used exactly as distilled (no padding bits)
+    return max(0, int(math.floor(length)) // 8 * 8), e_up
 
 
-def toeplitz_hash(bits: Sequence[int], out_len: int, seed: int) -> List[int]:
+def toeplitz_seed_bytes(n: int, out_len: int) -> int:
+    """Number of bytes needed for a fully random out_len x n Toeplitz matrix."""
+    return (n + out_len - 1 + 7) // 8
+
+
+def new_toeplitz_seed(n: int, out_len: int) -> bytes:
     """
-    Multiply the key (as a GF(2) vector) by an out_len x n Toeplitz
-    matrix generated from a public random seed.
+    n + out_len - 1 TRULY random bits (OS CSPRNG) - one per diagonal.
+    The leftover hash lemma needs the matrix drawn uniformly from the whole
+    Toeplitz family; stretching a short seed with a PRNG would not give that.
+    The seed is public (sent in the clear and covered by the signed transcript).
+    """
+    return os.urandom(toeplitz_seed_bytes(n, out_len))
+
+
+def toeplitz_hash(bits: Sequence[int], out_len: int, seed: bytes) -> List[int]:
+    """
+    y = T x over GF(2), where T is the out_len x n Toeplitz matrix whose
+    n + out_len - 1 diagonals are the first bits of `seed`:
+        T[i][j] = d[i - j + n - 1]
     """
     n = len(bits)
     if out_len <= 0 or n == 0:
         return []
-    diag = np.random.default_rng(seed).integers(0, 2, n + out_len - 1, dtype=np.int64)
+    if out_len > n:
+        raise ValueError("privacy amplification cannot output more bits than it gets")
+    if len(seed) != toeplitz_seed_bytes(n, out_len):
+        raise ValueError(f"Toeplitz seed must be {toeplitz_seed_bytes(n, out_len)} bytes, got {len(seed)}")
+    diag = np.unpackbits(np.frombuffer(seed, dtype=np.uint8))[: n + out_len - 1].astype(np.int64)
     idx = np.arange(out_len)[:, None] - np.arange(n)[None, :] + (n - 1)
-    matrix = diag[idx]
     x = np.asarray(bits, dtype=np.int64)
-    return ((matrix @ x) % 2).astype(int).tolist()
+    return ((diag[idx] @ x) % 2).astype(int).tolist()
 
 
 def bits_to_bytes(bits: Sequence[int]) -> bytes:

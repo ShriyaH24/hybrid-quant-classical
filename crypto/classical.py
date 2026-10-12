@@ -11,6 +11,8 @@ It exists so the link degrades instead of failing, and every Gear 1
 epoch is logged as a documented quantum risk.
 """
 
+import hashlib
+import hmac
 from typing import Tuple
 
 from cryptography.exceptions import InvalidSignature
@@ -54,3 +56,13 @@ def ed25519_verify(public_raw: bytes, message: bytes, signature: bytes) -> bool:
 
 def hkdf(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+
+
+# ---------------- HMAC (key confirmation) ----------------
+
+def hmac_sha256(key: bytes, message: bytes) -> bytes:
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
+def hmac_verify(key: bytes, message: bytes, tag: bytes) -> bool:
+    return hmac.compare_digest(hmac_sha256(key, message), tag)

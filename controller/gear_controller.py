@@ -31,8 +31,8 @@ SUITES = {
     1: "X25519 ECDH + AES-256-GCM  (auth: Ed25519)",
 }
 SECURITY = {
-    3: "Information-theoretic + post-quantum",
-    2: "Post-quantum",
+    3: "Hybrid: key stays secret unless BOTH QKD and ML-KEM are broken",
+    2: "Post-quantum (ML-KEM-768)",
     1: "Classical only - DOCUMENTED QUANTUM RISK",
 }
 

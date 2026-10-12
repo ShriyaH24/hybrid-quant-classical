@@ -13,7 +13,9 @@ One key-establishment EPOCH. Alice drives, Bob responds.
   6. GEAR_COMMIT / GEAR_CONFIRM: each side signs the hash of the whole
      transcript (ML-DSA-65 if PQC, else Ed25519) with its pinned
      identity key. Any tampering -> signatures fail -> epoch aborted.
-  7. HKDF(secrets for that gear, nonces, transcript) -> AES-256 key.
+  7. HKDF(labelled secrets of that gear, nonces, gear, epoch, transcript)
+     -> AES-256 session key + two key-confirmation keys. Each side proves
+     it holds the same key (HMAC over the transcript) before using it.
 
 Nothing derived in an epoch is used until step 6 succeeds.
 """
@@ -34,7 +36,8 @@ from crypto.error_correction import (answer_queries, block_sizes, initial_block_
                                      make_permutations, reconcile)
 from crypto.identity import Identity, PeerKeys
 from crypto.key_verification import tags_match, verification_tag
-from crypto.privacy import bits_to_bytes, qber_upper_bound, secret_key_length, toeplitz_hash
+from crypto.privacy import (bits_to_bytes, new_toeplitz_seed, qber_upper_bound, secret_key_length,
+                            toeplitz_hash, toeplitz_seed_bytes)
 from network.messages import MessageType as M
 from network.protocol import Session
 from quantum import client as qclient
@@ -117,11 +120,63 @@ def _verify(ctx: NodeContext, use_pqc: bool, alg: str, message: bytes, sig: byte
     return classical.ed25519_verify(ctx.peer.ed25519_public, message, sig)
 
 
-def _derive(gear: int, qkd_key: bytes, kem_ss: bytes, ecdh_ss: bytes,
-            nonce_a: bytes, nonce_b: bytes, epoch: int, transcript: bytes) -> bytes:
-    ikm = {3: qkd_key + kem_ss, 2: kem_ss, 1: ecdh_ss}[gear]
-    info = f"HCQC-v1 session key|gear={gear}|epoch={epoch}|".encode() + transcript
-    return classical.hkdf(ikm, salt=nonce_a + nonce_b, info=info)
+KDF_LABEL = b"HCQC-v1"
+
+
+def _encode_secret(label: bytes, value: bytes) -> bytes:
+    """label | 4-byte length | value  - unambiguous, so no two different
+    (qkd, kem) pairs can ever produce the same HKDF input."""
+    return label + len(value).to_bytes(4, "big") + value
+
+
+def derive_keys(gear: int, qkd_key: bytes, kem_ss: bytes, ecdh_ss: bytes,
+                nonce_a: bytes, nonce_b: bytes, epoch: int, transcript: bytes):
+    """
+    Hybrid key schedule (HKDF-SHA256, RFC 5869).
+
+      IKM  = only the secrets of the negotiated gear, each labelled + length-prefixed
+               Gear 3: QKD key || ML-KEM secret   (secure if EITHER one is)
+               Gear 2: ML-KEM secret
+               Gear 1: X25519 secret
+      salt = nonce_A || nonce_B                   (fresh per epoch)
+      PRK  = HKDF-Extract(salt, IKM)
+      each output key = HKDF-Expand(PRK, label | gear | epoch | transcript hash)
+
+    Binding gear, epoch and the full transcript hash into every label means
+    Alice and Bob get the same keys ONLY if they saw byte-identical handshakes
+    and agreed on the same gear. Distinct labels give independent keys for
+    encryption and for each side's key confirmation.
+    """
+    if len(nonce_a) != 16 or len(nonce_b) != 16:
+        raise ValueError("nonces must be 16 bytes")
+    if gear == 3:
+        if not qkd_key or len(kem_ss) != 32:
+            raise ValueError("Gear 3 needs both a QKD key and a 32-byte ML-KEM secret")
+        ikm = _encode_secret(b"qkd", qkd_key) + _encode_secret(b"mlkem768", kem_ss)
+    elif gear == 2:
+        if len(kem_ss) != 32:
+            raise ValueError("Gear 2 needs a 32-byte ML-KEM secret")
+        ikm = _encode_secret(b"mlkem768", kem_ss)
+    elif gear == 1:
+        if len(ecdh_ss) != 32:
+            raise ValueError("Gear 1 needs a 32-byte X25519 secret")
+        ikm = _encode_secret(b"x25519", ecdh_ss)
+    else:
+        raise ValueError(f"unknown gear {gear}")
+
+    def out(purpose: str) -> bytes:
+        info = KDF_LABEL + f"|{purpose}|gear={gear}|epoch={epoch}|".encode() + transcript
+        return classical.hkdf(ikm, salt=nonce_a + nonce_b, info=info)
+
+    return {
+        "session": out("session key"),
+        "confirm_alice": out("key confirmation alice"),
+        "confirm_bob": out("key confirmation bob"),
+    }
+
+
+def _confirm_tag(keys: dict, role: str, transcript: bytes) -> bytes:
+    return classical.hmac_sha256(keys[f"confirm_{role}"], KDF_LABEL + f"|finished|{role}|".encode() + transcript)
 
 
 # =====================================================================
@@ -173,8 +228,8 @@ def _alice_qkd(s: Session, ctx: NodeContext, obs: Observations,
                            f"(need {config.MIN_QKD_KEY_BITS}) - QKD key discarded")
         return b""
 
-    pa_seed = secrets.randbits(128)
-    s.send(M.PRIVACY_SEED, {"seed": pa_seed})
+    pa_seed = new_toeplitz_seed(len(key), length)          # n + l - 1 truly random bits
+    s.send(M.PRIVACY_SEED, {"seed": pa_seed.hex()})
     final = toeplitz_hash(key, length, pa_seed)
     obs.qkd_key_bits = length
     ctx.log("PRIVACY", f"{len(key)} bits -> {length} secret bits (QBER bound {e_up:.2%})")
@@ -233,21 +288,25 @@ def alice_run_epoch(s: Session, ctx: NodeContext, epoch: int) -> EpochKey:
         s.end_transcript()
         raise EpochAborted(reason)
 
-    # 6. signed commit
+    # 6. derive keys, then signed commit + key confirmation
     transcript = s.transcript_hash()
+    keys = derive_keys(gear, qkd_key, kem_ss, ecdh_ss, nonce_a, nonce_b, epoch, transcript)
     alg, sig = _sign(ctx, obs.pqc_ok, _sig_message("alice", epoch, gear, transcript))
-    s.send(M.GEAR_COMMIT, {"gear": gear, "alg": alg, "sig": sig.hex()})
+    s.send(M.GEAR_COMMIT, {"gear": gear, "alg": alg, "sig": sig.hex(),
+                           "mac": _confirm_tag(keys, "alice", transcript).hex()})
     conf = s.recv(M.GEAR_CONFIRM)["payload"]
     if not _verify(ctx, obs.pqc_ok, conf["alg"], _sig_message("bob", epoch, gear, transcript),
                    bytes.fromhex(conf["sig"])):
         raise AuthenticationError("Bob's transcript signature is invalid - possible man-in-the-middle")
+    if not classical.hmac_verify(keys["confirm_bob"], KDF_LABEL + b"|finished|bob|" + transcript,
+                                 bytes.fromhex(conf["mac"])):
+        raise AuthenticationError("Bob derived a different key - key confirmation failed")
     s.end_transcript()
-    ctx.log("AUTH", f"transcript signed and verified ({alg})")
+    ctx.log("AUTH", f"transcript signed and verified ({alg}); key confirmed by both sides")
 
     # 7. key
-    key = _derive(gear, qkd_key, kem_ss, ecdh_ss, nonce_a, nonce_b, epoch, transcript)
     ctx.gears.commit(epoch, gear, obs)
-    return EpochKey(epoch, gear, key)
+    return EpochKey(epoch, gear, keys["session"])
 
 
 # =====================================================================
@@ -296,7 +355,10 @@ def _bob_qkd(s: Session, ctx: NodeContext, obs: Observations, b_bits, b_bases) -
                            f"(need {config.MIN_QKD_KEY_BITS}) - QKD key discarded")
         return b""
 
-    final = toeplitz_hash(key, length, s.recv(M.PRIVACY_SEED)["payload"]["seed"])
+    pa_seed = bytes.fromhex(s.recv(M.PRIVACY_SEED)["payload"]["seed"])
+    if len(pa_seed) != toeplitz_seed_bytes(len(key), length):
+        raise EpochAborted("privacy-amplification seed has the wrong size")
+    final = toeplitz_hash(key, length, pa_seed)
     obs.qkd_key_bits = length
     ctx.log("PRIVACY", f"{len(key)} bits -> {length} secret bits")
     return bits_to_bytes(final)
@@ -357,14 +419,19 @@ def bob_handle_epoch(s: Session, ctx: NodeContext, start_packet: dict) -> EpochK
     if not ctx.gears.permitted(gear):
         abort(f"negotiated Gear {gear} is below Bob's minimum Gear {ctx.gears.min_gear}")
 
-    alg, sig = _sign(ctx, obs.pqc_ok, _sig_message("bob", epoch, gear, transcript))
-    s.send(M.GEAR_CONFIRM, {"alg": alg, "sig": sig.hex()})
-    s.end_transcript()
-    ctx.log("AUTH", f"transcript signed and verified ({alg})")
+    keys = derive_keys(gear, qkd_key, kem_ss, ecdh_ss, nonce_a, nonce_b, epoch, transcript)
+    if not classical.hmac_verify(keys["confirm_alice"], KDF_LABEL + b"|finished|alice|" + transcript,
+                                 bytes.fromhex(commit.get("mac", ""))):
+        abort("Alice derived a different key - key confirmation failed", AuthenticationError)
 
-    key = _derive(gear, qkd_key, kem_ss, ecdh_ss, nonce_a, nonce_b, epoch, transcript)
+    alg, sig = _sign(ctx, obs.pqc_ok, _sig_message("bob", epoch, gear, transcript))
+    s.send(M.GEAR_CONFIRM, {"alg": alg, "sig": sig.hex(),
+                            "mac": _confirm_tag(keys, "bob", transcript).hex()})
+    s.end_transcript()
+    ctx.log("AUTH", f"transcript signed and verified ({alg}); key confirmed by both sides")
+
     ctx.gears.commit(epoch, gear, obs)
-    return EpochKey(epoch, gear, key)
+    return EpochKey(epoch, gear, keys["session"])
 
 
 # =====================================================================
