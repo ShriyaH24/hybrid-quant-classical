@@ -77,11 +77,15 @@ class ChannelMonitor:
                  interval: float = config.PROBE_INTERVAL,
                  probe_qubits: int = config.PROBE_QUBITS,
                  confirmations: int = config.UPSHIFT_CONFIRMATIONS,
-                 report: Callable[[str], None] = print):
+                 report: Callable[[str], None] = print,
+                 on_tick: Optional[Callable[[], None]] = None,
+                 alive: Optional[Callable[[], bool]] = None):
         self.session, self.ctx, self.lock = session, ctx, lock
         self.current_gear, self.rekey = current_gear, rekey
         self.interval, self.probe_qubits, self.confirmations = interval, probe_qubits, confirmations
         self.report = report
+        self.on_tick = on_tick          # e.g. routine key rotation, run before each probe
+        self.alive = alive              # stop when the session is gone
         self.healthy_streak = 0
         self.last: Optional[Decision] = None
         self.verbose = True
@@ -90,6 +94,7 @@ class ChannelMonitor:
 
     def check_once(self) -> Decision:
         with self.lock:
+            self.session.drain()                     # stale frames from an aborted exchange
             probe = alice_probe(self.session, self.ctx, self.probe_qubits)
             predicted, why = predict_gear(probe, self.ctx.pqc_capable, self.ctx.peer_pqc_last)
             current = self.current_gear()
@@ -137,9 +142,14 @@ class ChannelMonitor:
 
     def _loop(self):
         while not self._stop.wait(self.interval):
-            try:
-                self.check_once()
-            except Exception as exc:                        # connection closed etc.
-                if not self._stop.is_set():
-                    self.report(f"\n[MONITOR] stopped: {exc}")
+            if self.alive is not None and not self.alive():
                 return
+            try:
+                if self.on_tick is not None:
+                    self.on_tick()
+                self.check_once()
+            except ConnectionError:
+                return
+            except Exception as exc:                        # one bad probe must not stop monitoring
+                if not self._stop.is_set():
+                    self.report(f"\n[MONITOR] probe failed ({exc}) - will retry")

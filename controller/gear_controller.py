@@ -45,6 +45,7 @@ class Observations:
     qkd_key_bits: int = 0
     pqc_local: bool = False
     pqc_peer: bool = False
+    ec_leaked: int = 0               # parity bits revealed by Cascade
     reasons: List[str] = field(default_factory=list)
 
     @property
@@ -76,6 +77,7 @@ class GearRecord:
     qber: Optional[float]
     reasons: List[str]
     time: str
+    ec_leaked: int = 0
 
 
 class GearController:
@@ -95,7 +97,7 @@ class GearController:
         previous = self.current
         self.current = gear
         self.history.append(GearRecord(epoch, gear, obs.qber, list(obs.reasons),
-                                       datetime.now().strftime("%H:%M:%S")))
+                                       datetime.now().strftime("%H:%M:%S"), obs.ec_leaked))
         self._announce(previous, gear, epoch, obs)
 
     # ------------------------------------------------------------------

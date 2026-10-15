@@ -1,17 +1,23 @@
 """
 quantum/channel_server.py
 
-Runs the simulated quantum channel as its own process, with a console
-to attack or break it while Alice and Bob are talking.
+EVE'S STATION. Runs the simulated quantum channel (which Alice and Bob both
+use) and, optionally, a tap on the classical link between them. The console
+lets Eve attack or break either one while Alice and Bob are talking.
 
-    python -m quantum.channel_server            # clean channel, 2% noise
-    python -m quantum.channel_server --eve      # start with Eve listening
+    python quantum/channel_server.py                          # one machine
+    python quantum/channel_server.py --host 0.0.0.0           # own machine
+    python quantum/channel_server.py --host 0.0.0.0 --tap-to <BOB_IP>
+                                     # + classical tap: Alice connects to port 5001 here
 
 Console commands:
-    eve on | eve off      intercept-resend eavesdropper
+    eve on | eve off      intercept-resend attack on the photons
     noise <p>             channel bit-error rate, e.g. noise 0.05
     link down | link up   cut / restore the quantum link
     watch on | watch off  show / hide a line for every 5-second probe
+    tap off|on|all        classical tap: silent / show chat / show every packet
+    tamper message        flip one character in the next chat message
+    tamper handshake      flip one character in the next key-exchange packet
     status                show current settings
     quit
 
@@ -30,6 +36,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from network.messages import MessageType                      # noqa: E402
 from network.protocol import receive_packet, send_packet      # noqa: E402
+from network.relay import ClassicalTap                        # noqa: E402
 from quantum.channel import QuantumChannel, QuantumLinkError  # noqa: E402
 
 SESSION_TTL = 120   # seconds a batch of photons waits for Bob
@@ -129,9 +136,11 @@ class ChannelServer:
                 f"eve={'ON' if c.eve else 'off'}  listening on {self.host}:{self.port}")
 
 
-def console(server: ChannelServer):
+def console(server: ChannelServer, tap=None):
     print(__doc__.split("Console commands:")[1])
     print(f"[CHANNEL] {server.status()}")
+    if tap:
+        print(f"[EVE] {tap.status()}")
     server.interactive = True
     ch = server.channel
     while True:
@@ -158,6 +167,19 @@ def console(server: ChannelServer):
             server.show_probes = True
         elif cmd == ["watch", "off"]:
             server.show_probes = False
+        elif cmd[0] in ("tap", "tamper"):
+            if tap is None:
+                print("no classical tap running - start with --tap-to <BOB_IP>")
+                continue
+            if cmd[0] == "tap" and len(cmd) == 2 and cmd[1] in ("off", "on", "all"):
+                tap.mode = cmd[1]
+            elif cmd[0] == "tamper" and len(cmd) == 2 and cmd[1] in ("message", "handshake", "off"):
+                tap.tamper = None if cmd[1] == "off" else cmd[1]
+            else:
+                print("usage: tap off|on|all   |   tamper message|handshake|off")
+                continue
+            print(f"[EVE] {tap.status()}")
+            continue
         elif cmd[0] == "noise" and len(cmd) == 2:
             try:
                 value = float(cmd[1].rstrip("%"))
@@ -168,9 +190,12 @@ def console(server: ChannelServer):
                 value /= 100
             ch.noise = min(0.5, max(0.0, value))
         elif cmd[0] != "status":
-            print("commands: eve on|off, noise <p>, link up|down, watch on|off, status, quit")
+            print("commands: eve on|off, noise <p>, link up|down, watch on|off, "
+                  "tap off|on|all, tamper message|handshake, status, quit")
             continue
         print(f"[CHANNEL] {server.status()}  probes={'shown' if server.show_probes else 'hidden'}")
+        if tap and cmd[0] == "status":
+            print(f"[EVE] {tap.status()}")
 
 
 def main():
@@ -180,6 +205,9 @@ def main():
     ap.add_argument("--noise", type=float, default=0.02, help="bit-error rate of the channel")
     ap.add_argument("--eve", action="store_true", help="start with the eavesdropper active")
     ap.add_argument("--link-down", action="store_true", help="start with the link broken")
+    ap.add_argument("--tap-to", metavar="BOB_HOST[:PORT]",
+                    help="also tap the classical link: Alice connects here, Eve relays to Bob")
+    ap.add_argument("--tap-port", type=int, default=5001, help="port Alice connects to for the tap")
     a = ap.parse_args()
 
     print("=" * 60)
@@ -187,7 +215,14 @@ def main():
     print("=" * 60)
     channel = QuantumChannel(noise=a.noise, eve=a.eve, link_up=not a.link_down)
     server = ChannelServer(channel, a.host, a.port).start()
-    console(server)
+    tap = None
+    if a.tap_to:
+        bob_host, _, bob_port = a.tap_to.partition(":")
+        tap = ClassicalTap(a.host, a.tap_port, bob_host, int(bob_port or 5000),
+                           log=lambda m: print(f"\n{m}\nchannel> ", end="", flush=True)).start()
+    console(server, tap)
+    if tap:
+        tap.stop()
     server.stop()
 
 

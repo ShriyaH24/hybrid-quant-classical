@@ -10,12 +10,13 @@ verifies the peer against a public key it already has ("pinned").
 
 Generate once (from the project root):
 
-    python -m crypto.identity
+    python -m crypto.identity                 # one machine: both parties
+    python -m crypto.identity --party alice   # Alice's machine: only Alice's keys
+    python -m crypto.identity --party bob     # Bob's machine: only Bob's keys
 
-This writes keys/ with an ML-DSA-65 and an Ed25519 key pair for each
-party. In a real deployment each party generates its own private key
-and only the public keys are exchanged out-of-band; here both live on
-one machine for the demo.
+On separate machines each party keeps its private key (*.key) to itself
+and copies only its PUBLIC keys (*.pub) to the other machine's keys/
+folder (USB stick, email - public keys are not secret).
 """
 
 import argparse
@@ -62,9 +63,9 @@ def _write(path: str, data: bytes) -> None:
         f.write(data)
 
 
-def generate_all(force: bool = False) -> None:
+def generate_all(force: bool = False, parties=PARTIES) -> None:
     os.makedirs(KEY_DIR, exist_ok=True)
-    for name in PARTIES:
+    for name in parties:
         if os.path.exists(_path(name, "ed25519.key")) and not force:
             print(f"[KEYS] {name}: keys already exist (use --force to replace)")
             continue
@@ -99,11 +100,21 @@ def load_identity(name: str) -> Identity:
 def load_peer(name: str) -> PeerKeys:
     pk = _read(_path(name, "ed25519.pub"))
     if pk is None:
-        raise SystemExit(f"[KEYS] Missing public key for '{name}'. Run: python -m crypto.identity")
+        raise SystemExit(f"[KEYS] Missing {name.capitalize()}'s public key. On one machine run: "
+                         f"python -m crypto.identity\n       On separate machines copy {name}_ed25519.pub "
+                         f"and {name}_mldsa65.pub from {name.capitalize()}'s keys/ folder into this keys/ folder.")
     return PeerKeys(name=name, ed25519_public=pk, mldsa_public=_read(_path(name, "mldsa65.pub")))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Alice/Bob identity keys")
     parser.add_argument("--force", action="store_true", help="overwrite existing keys")
-    generate_all(parser.parse_args().force)
+    parser.add_argument("--party", choices=PARTIES, help="only this party's keys (one per machine)")
+    args = parser.parse_args()
+    generate_all(args.force, (args.party,) if args.party else PARTIES)
+    if args.party:
+        other = "bob" if args.party == "alice" else "alice"
+        print(f"\nNow copy these PUBLIC files to the keys/ folder on {other.capitalize()}'s machine:")
+        for kind in ("ed25519.pub", "mldsa65.pub"):
+            print(f"    keys/{args.party}_{kind}")
+        print(f"and copy {other}_ed25519.pub + {other}_mldsa65.pub from there into this keys/ folder.")

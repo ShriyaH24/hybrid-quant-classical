@@ -14,7 +14,9 @@ handshake: if anyone changed a single byte in transit (e.g. stripped
 
 import hashlib
 import json
+import queue
 import struct
+import threading
 from typing import Optional
 
 from network.messages import MessageType
@@ -70,10 +72,22 @@ def receive_packet(sock) -> dict:
 
 
 class Session:
-    """A socket plus an optional running transcript hash."""
+    """
+    A socket plus an optional running transcript hash.
 
-    def __init__(self, sock):
+    Two ways to receive:
+      * direct  - recv() reads the socket itself (single-threaded use, tests)
+      * inbox   - a background reader (controller/node.py) owns the socket,
+                  handles chat itself and puts every handshake/probe frame
+                  into `inbox`; recv() then takes frames from the queue.
+    Sends are serialised by a lock, so chat from one thread and handshake
+    traffic from another never interleave inside a frame.
+    """
+
+    def __init__(self, sock, inbox: Optional["queue.Queue"] = None):
         self.sock = sock
+        self.inbox = inbox
+        self._send_lock = threading.Lock()
         self._transcript = None
         self._last_raw = b""
         self.hash_before_last_recv = b""
@@ -91,14 +105,28 @@ class Session:
         self._transcript = None
 
     # -- I/O ----------------------------------------------------
-    def send(self, message_type, payload: Optional[dict] = None) -> None:
+    def send(self, message_type, payload: Optional[dict] = None, transcript: bool = True) -> None:
+        """transcript=False for chat/close: never part of a handshake hash."""
         raw = encode_packet(message_type, payload)
-        if self._transcript is not None:
+        if transcript and self._transcript is not None:
             self._transcript.update(raw)
-        self.sock.sendall(struct.pack(">I", len(raw)) + raw)
+        with self._send_lock:
+            self.sock.sendall(struct.pack(">I", len(raw)) + raw)
 
-    def recv(self, *expected: MessageType) -> dict:
-        raw = read_frame(self.sock)
+    def _next_raw(self, timeout: Optional[float]) -> bytes:
+        if self.inbox is None:
+            return read_frame(self.sock)
+        try:
+            raw = self.inbox.get(timeout=timeout)
+        except queue.Empty:
+            raise ProtocolError(f"no reply from peer within {timeout:.0f}s")
+        if raw is None:                                    # reader saw the connection close
+            self.inbox.put(None)                           # keep the signal for other waiters
+            raise ConnectionError("Connection closed by peer.")
+        return raw
+
+    def recv(self, *expected: MessageType, timeout: Optional[float] = 60.0) -> dict:
+        raw = self._next_raw(timeout)
         self.hash_before_last_recv = self.transcript_hash()
         if self._transcript is not None:
             self._transcript.update(raw)
@@ -110,6 +138,20 @@ class Session:
             raise ProtocolError(
                 f"Expected {'/'.join(e.value for e in expected)}, got {packet['type']}")
         return packet
+
+    def drain(self) -> int:
+        """Throw away stale handshake frames left over from an aborted epoch."""
+        dropped = 0
+        while self.inbox is not None:
+            try:
+                raw = self.inbox.get_nowait()
+            except queue.Empty:
+                break
+            if raw is None:
+                self.inbox.put(None)
+                break
+            dropped += 1
+        return dropped
 
     def close(self) -> None:
         try:

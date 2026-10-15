@@ -66,7 +66,7 @@ BASE = dict(gear=3, qkd_key=os.urandom(80), kem_ss=os.urandom(32), ecdh_ss=os.ur
 def test_same_inputs_same_keys_and_keys_are_independent():
     k1, k2 = derive_keys(**BASE), derive_keys(**BASE)
     assert k1 == k2
-    assert len({k1["session"], k1["confirm_alice"], k1["confirm_bob"]}) == 3
+    assert len({k1["alice_to_bob"], k1["bob_to_alice"], k1["confirm_alice"], k1["confirm_bob"]}) == 4
 
 
 @pytest.mark.parametrize("field,value", [
@@ -75,7 +75,9 @@ def test_same_inputs_same_keys_and_keys_are_independent():
     ("qkd_key", os.urandom(80)), ("kem_ss", os.urandom(32)),
 ])
 def test_any_change_gives_a_different_key(field, value):
-    assert derive_keys(**{**BASE, field: value})["session"] != derive_keys(**BASE)["session"]
+    changed, base = derive_keys(**{**BASE, field: value}), derive_keys(**BASE)
+    assert changed["alice_to_bob"] != base["alice_to_bob"]
+    assert changed["bob_to_alice"] != base["bob_to_alice"]
 
 
 def test_secrets_cannot_be_shifted_between_components():

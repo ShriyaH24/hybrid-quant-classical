@@ -33,7 +33,7 @@ from crypto.aes import decrypt_message, encrypt_message
 from crypto.bb84 import (calculate_qber, choose_sample, matching_indices, random_bases,
                          random_bits, remove_indices, select, sift_and_sample)
 from crypto.error_correction import (answer_queries, block_sizes, initial_block_size,
-                                     make_permutations, reconcile)
+                                     make_permutations, reconcile, validate_queries)
 from crypto.identity import Identity, PeerKeys
 from crypto.key_verification import tags_match, verification_tag
 from crypto.privacy import (bits_to_bytes, new_toeplitz_seed, qber_upper_bound, secret_key_length,
@@ -50,6 +50,17 @@ class EpochAborted(Exception):
 
 class AuthenticationError(Exception):
     pass
+
+
+def announced(exc: Exception) -> Exception:
+    """Mark an error whose EPOCH_ABORT has already been sent to the peer."""
+    exc.announced = True
+    return exc
+
+
+def peer_already_knows(exc: Exception) -> bool:
+    """True if the peer sent the abort, or we already told it."""
+    return getattr(exc, "announced", False) or str(exc).startswith("Peer aborted")
 
 
 @dataclass
@@ -81,13 +92,23 @@ class NodeContext:
 
 @dataclass
 class EpochKey:
+    """The keys of one epoch: one AES-256 key PER DIRECTION, so a message
+    Bob sent can never be reflected back to him and accepted."""
     epoch: int
     gear: int
-    key: bytes
+    alice_to_bob: bytes
+    bob_to_alice: bytes
+
+    def key_from(self, sender: str) -> bytes:
+        if sender == "alice":
+            return self.alice_to_bob
+        if sender == "bob":
+            return self.bob_to_alice
+        raise ValueError(f"unknown sender {sender!r}")
 
     @property
     def fingerprint(self) -> str:
-        return hashlib.sha256(b"fp|" + self.key).hexdigest()[:12]
+        return hashlib.sha256(b"fp|" + self.alice_to_bob + self.bob_to_alice).hexdigest()[:12]
 
 
 # =====================================================================
@@ -144,8 +165,9 @@ def derive_keys(gear: int, qkd_key: bytes, kem_ss: bytes, ecdh_ss: bytes,
 
     Binding gear, epoch and the full transcript hash into every label means
     Alice and Bob get the same keys ONLY if they saw byte-identical handshakes
-    and agreed on the same gear. Distinct labels give independent keys for
-    encryption and for each side's key confirmation.
+    and agreed on the same gear. Distinct labels give four independent keys:
+    Alice->Bob encryption, Bob->Alice encryption, and one key-confirmation
+    key per side.
     """
     if len(nonce_a) != 16 or len(nonce_b) != 16:
         raise ValueError("nonces must be 16 bytes")
@@ -169,7 +191,8 @@ def derive_keys(gear: int, qkd_key: bytes, kem_ss: bytes, ecdh_ss: bytes,
         return classical.hkdf(ikm, salt=nonce_a + nonce_b, info=info)
 
     return {
-        "session": out("session key"),
+        "alice_to_bob": out("traffic key alice to bob"),
+        "bob_to_alice": out("traffic key bob to alice"),
         "confirm_alice": out("key confirmation alice"),
         "confirm_bob": out("key confirmation bob"),
     }
@@ -211,9 +234,13 @@ def _alice_qkd(s: Session, ctx: NodeContext, obs: Observations,
 
     def ask(queries):
         s.send(M.PARITY_REQUEST, {"q": [list(q) for q in queries]})
-        return s.recv(M.PARITY_RESPONSE)["payload"]["p"]
+        answers = s.recv(M.PARITY_RESPONSE)["payload"]["p"]
+        if len(answers) != len(queries) or any(a not in (0, 1) for a in answers):
+            raise EpochAborted("malformed parity response")
+        return answers
 
     key, leaked, fixed = reconcile(key, perms, block_sizes(k1, config.CASCADE_PASSES, len(key)), ask)
+    obs.ec_leaked = leaked
     nonce = os.urandom(16)
     s.send(M.RECON_DONE, {"nonce": nonce.hex(), "tag": verification_tag(key, nonce, config.VERIFY_TAG_BITS)})
     if not s.recv(M.RECON_VERIFY)["payload"]["ok"]:
@@ -284,9 +311,9 @@ def alice_run_epoch(s: Session, ctx: NodeContext, epoch: int) -> EpochKey:
     gear = ctx.gears.decide(obs)
     if not ctx.gears.permitted(gear):
         reason = f"negotiated Gear {gear} is below the minimum Gear {ctx.gears.min_gear}"
-        s.send(M.EPOCH_ABORT, {"reason": reason})
+        s.send(M.EPOCH_ABORT, {"epoch": epoch, "reason": reason})
         s.end_transcript()
-        raise EpochAborted(reason)
+        raise announced(EpochAborted(reason))
 
     # 6. derive keys, then signed commit + key confirmation
     transcript = s.transcript_hash()
@@ -306,7 +333,7 @@ def alice_run_epoch(s: Session, ctx: NodeContext, epoch: int) -> EpochKey:
 
     # 7. key
     ctx.gears.commit(epoch, gear, obs)
-    return EpochKey(epoch, gear, keys["session"])
+    return EpochKey(epoch, gear, keys["alice_to_bob"], keys["bob_to_alice"])
 
 
 # =====================================================================
@@ -318,6 +345,10 @@ def _bob_qkd(s: Session, ctx: NodeContext, obs: Observations, b_bits, b_bases) -
     if len(sift["bases"]) != len(b_bases):
         raise EpochAborted("basis list length mismatch")
     sample_idx = sift["sample_idx"]
+    n_sifted = len(matching_indices(sift["bases"], b_bases))
+    if (len(set(sample_idx)) != len(sample_idx) or len(sift["sample_bits"]) != len(sample_idx)
+            or any(not 0 <= i < n_sifted for i in sample_idx)):
+        raise EpochAborted("malformed QBER sample")
     b_sample, key = sift_and_sample(b_bits, sift["bases"], b_bases, sample_idx)
     s.send(M.QKD_SAMPLE, {"bits": b_sample})
     obs.qber = calculate_qber(sift["sample_bits"], b_sample)
@@ -329,16 +360,21 @@ def _bob_qkd(s: Session, ctx: NodeContext, obs: Observations, b_bits, b_bases) -
         return b""
 
     r = s.recv(M.RECON_START)["payload"]
-    passes = min(int(r["passes"]), 16)
-    perms = make_permutations(len(key), r["seed"], passes)
+    passes = int(r["passes"])
+    if not 1 <= passes <= 16:
+        raise EpochAborted("invalid number of Cascade passes")
+    perms = make_permutations(len(key), int(r["seed"]), passes)
     leaked = 0
     while True:
         pkt = s.recv(M.PARITY_REQUEST, M.RECON_DONE)
         if pkt["type"] == M.RECON_DONE.value:
             break
-        queries = pkt["payload"]["q"]
+        queries = validate_queries(pkt["payload"]["q"], len(key), passes)
         leaked += len(queries)
+        if leaked >= len(key):                 # nothing secret could be left
+            raise EpochAborted("Cascade revealed as many parities as key bits")
         s.send(M.PARITY_RESPONSE, {"p": answer_queries(key, perms, queries)})
+    obs.ec_leaked = leaked
 
     done = pkt["payload"]
     ok = tags_match(verification_tag(key, bytes.fromhex(done["nonce"]), config.VERIFY_TAG_BITS), done["tag"])
@@ -407,9 +443,9 @@ def bob_handle_epoch(s: Session, ctx: NodeContext, start_packet: dict) -> EpochK
     transcript = s.hash_before_last_recv
 
     def abort(reason, exc=EpochAborted):
-        s.send(M.EPOCH_ABORT, {"reason": reason})
+        s.send(M.EPOCH_ABORT, {"epoch": epoch, "reason": reason})
         s.end_transcript()
-        raise exc(reason)
+        raise announced(exc(reason))
 
     if int(commit["gear"]) != gear:
         abort(f"gear mismatch: Alice proposed {commit['gear']}, Bob computed {gear} (possible downgrade)")
@@ -431,7 +467,7 @@ def bob_handle_epoch(s: Session, ctx: NodeContext, start_packet: dict) -> EpochK
     ctx.log("AUTH", f"transcript signed and verified ({alg}); key confirmed by both sides")
 
     ctx.gears.commit(epoch, gear, obs)
-    return EpochKey(epoch, gear, keys["session"])
+    return EpochKey(epoch, gear, keys["alice_to_bob"], keys["bob_to_alice"])
 
 
 # =====================================================================
@@ -484,17 +520,24 @@ def bob_handle_probe(s: Session, ctx: NodeContext, packet: dict) -> None:
 # messages under the current epoch key
 # =====================================================================
 
-def _aad(epoch: int, seq: int, gear: int) -> bytes:
-    return f"HCQC-v1|epoch={epoch}|seq={seq}|gear={gear}".encode()
+def _aad(sender: str, epoch: int, seq: int, gear: int) -> bytes:
+    return f"HCQC-v1|from={sender}|epoch={epoch}|seq={seq}|gear={gear}".encode()
 
 
-def seal(k: EpochKey, seq: int, text: str) -> dict:
-    nonce, ct = encrypt_message(k.key, text, _aad(k.epoch, seq, k.gear))
-    return {"epoch": k.epoch, "seq": seq, "nonce": nonce.hex(), "ct": ct.hex()}
+def seal(k: EpochKey, sender: str, seq: int, text: str) -> dict:
+    """Encrypt with the sender's direction key; sender, epoch, seq and gear
+    are authenticated as associated data."""
+    nonce, ct = encrypt_message(k.key_from(sender), text, _aad(sender, k.epoch, seq, k.gear))
+    return {"from": sender, "epoch": k.epoch, "seq": seq, "nonce": nonce.hex(), "ct": ct.hex()}
 
 
-def open_sealed(k: EpochKey, payload: dict) -> str:
+def open_sealed(k: EpochKey, payload: dict, expected_sender: str) -> str:
+    """Decrypt a message that must come from `expected_sender`. A message
+    claiming any other sender (e.g. our own, reflected back) is rejected."""
+    if payload.get("from") != expected_sender:
+        raise ValueError(f"message claims sender {payload.get('from')!r}, expected {expected_sender!r}")
     if int(payload["epoch"]) != k.epoch:
-        raise ValueError(f"message for epoch {payload['epoch']}, current epoch is {k.epoch}")
-    return decrypt_message(k.key, bytes.fromhex(payload["nonce"]), bytes.fromhex(payload["ct"]),
-                           _aad(k.epoch, int(payload["seq"]), k.gear))
+        raise ValueError(f"message for epoch {payload['epoch']}, key is for epoch {k.epoch}")
+    return decrypt_message(k.key_from(expected_sender), bytes.fromhex(payload["nonce"]),
+                           bytes.fromhex(payload["ct"]),
+                           _aad(expected_sender, k.epoch, int(payload["seq"]), k.gear))

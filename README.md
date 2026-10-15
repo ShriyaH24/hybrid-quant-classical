@@ -73,6 +73,61 @@ node to refuse Gear 1 entirely. Alice also rotates keys every 3 messages
 
 ---
 
+## Three machines: Alice, Bob and Eve
+
+Alice and Bob chat in **both directions**; Eve's machine runs the quantum
+channel and taps the classical link between them.
+
+```
+ Alice's laptop                Eve's laptop                      Bob's laptop
+ alice.py  ----- port 5001 --> channel_server.py --tap-to ---> bob.py (port 5000)
+     \                           quantum channel :6000            /
+      `-------- photons -------->      ^      <------ measure ----'
+```
+
+Put all three on the same network (a phone hotspot is easiest - college Wi-Fi
+often blocks laptop-to-laptop traffic). Find each IP with `ipconfig`.
+Allow Python through Windows Firewall (Private networks) when prompted.
+
+**1. Keys - each person on their own machine**
+```powershell
+python -m crypto.identity --party alice      # on Alice's laptop
+python -m crypto.identity --party bob        # on Bob's laptop
+```
+Then copy the two `.pub` files each way (USB / email - they are public):
+Alice's `keys/alice_ed25519.pub` + `keys/alice_mldsa65.pub` → Bob's `keys/`,
+and Bob's `keys/bob_ed25519.pub` + `keys/bob_mldsa65.pub` → Alice's `keys/`.
+Eve needs no keys - she is not supposed to have any.
+
+**2. Start, in this order** (`<EVE_IP>`, `<BOB_IP>` = the real addresses)
+
+| Machine | Command |
+|---------|---------|
+| Bob | `python bob/bob.py --host 0.0.0.0 --channel-host <EVE_IP>` |
+| Eve | `python quantum/channel_server.py --host 0.0.0.0 --tap-to <BOB_IP>` |
+| Alice | `python alice/alice.py --host <EVE_IP> --port 5001 --channel-host <EVE_IP>` |
+
+Without the tap, Alice connects straight to Bob instead:
+`python alice/alice.py --host <BOB_IP> --channel-host <EVE_IP>` (and Eve drops `--tap-to`).
+
+**3. Talk and attack**
+
+| Who | Types | What happens |
+|-----|-------|--------------|
+| Alice / Bob | any text | encrypted to the other side, both directions |
+| Eve | *(watches)* | sees `intercepted ... unreadable` - ciphertext only |
+| Eve | `tamper message` | next message fails its AES-GCM tag and is rejected |
+| Eve | `eve on` / `eve off` | QBER ~25 % → monitor shifts 3 → 2, then back to 3 |
+| Eve | `noise 0.07` | QBER ~6 %, too little secret key → Gear 2 |
+| Eve | `link down` | quantum link cut → Gear 2 |
+| Eve | `tamper handshake` | next key exchange fails its signature check, no key for anyone; the monitor retries and recovers |
+| Alice | `/pqc off` (with `link down`) | → Gear 1 with the quantum-risk warning |
+| Eve | `tap all` | also lists every handshake packet she relays |
+
+Alice leads key exchanges (start, monitor, rotation every 3 messages in either
+direction); Bob can type at any time. A message that was in flight while a new
+epoch finished still decrypts (the previous epoch's keys are kept).
+
 ## How one epoch works
 
 ```
@@ -145,6 +200,7 @@ bob/bob.py                  responder, decrypts messages
 controller/config.py        thresholds and tunables
 controller/gear_controller.py  3-gear decision + transition log
 controller/monitor.py       continuous QBER probing -> automatic gear triggers
+controller/node.py          reader thread, two-way chat, per-epoch keys, replay checks
 controller/handshake.py     one epoch: BB84 post-processing, PQC, signatures, HKDF
 crypto/bb84.py              random bits/bases (secrets), sifting, sampling
 crypto/error_correction.py  Cascade
@@ -154,9 +210,11 @@ crypto/pqc.py               ML-KEM-768, ML-DSA-65
 crypto/classical.py         X25519, Ed25519, HKDF
 crypto/aes.py               AES-256-GCM
 crypto/identity.py          identity key generation / loading
-network/                    framing, transcript-hashing session, message types
+network/                    framing, transcript-hashing session, message types,
+                            relay.py = Eve's classical tap
 quantum/                    encoder, decoder, channel (noise/Eve), channel server
-tests/                      unit tests + end-to-end gear transitions
+tests/                      unit tests + end-to-end gear transitions + messaging
+tools/validate_cascade.py   statistical Cascade validation report
 ```
 
 ## Tests
@@ -171,6 +229,28 @@ transition: 3, Eve → 2, link down → 2, no PQC → 1, min-gear abort,
 forged identity rejected, 3 → 2 → 1 → 3 recovery, and the monitor
 shifting 3 → 2 → 3 → 1 → 3 with no manual re-key.
 
+`tests/test_cascade.py` validates reconciliation: every QBER up to 11 %,
+structured error patterns (bursts, pairs hidden in one block, periodic,
+degenerate keys), odd key lengths, many permutation seeds, exact leak
+accounting on both sides, malformed queries refused, and termination even
+when the peer answers inconsistently. `tests/test_messaging.py` covers
+two-way chat, chat during a key exchange, replay and reflection, and Eve's
+tap (ciphertext only, tampered message rejected, tampered handshake → no
+key, then recovery).
+
+Statistical report (≈ 2 min):
+
+```bash
+python tools/validate_cascade.py
+```
+
+| QBER | failures (500 runs) | leak vs Shannon limit | secret bits |
+|------|---------------------|-----------------------|-------------|
+| 1 % | 0 | 1.37× | ~1000 |
+| 3 % | 0 | 1.31× | ~565 |
+| 5 % | 0 | 1.32× | ~215 |
+| 8 % | 0 | 1.33× | 0 |
+
 ## Limitations (honest list)
 
 * The quantum channel is simulated; there is no real photon source.
@@ -180,4 +260,3 @@ shifting 3 → 2 → 3 → 1 → 3 with no manual re-key.
   is computational (quantum-resistant), not information-theoretic.
 * Both identity keys are generated on one machine for the demo; in
   practice each party keeps its own private key.
-* Only Alice sends messages; Bob responds to handshakes.

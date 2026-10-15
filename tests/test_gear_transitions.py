@@ -13,13 +13,15 @@ def agree(a, b, gear):
     assert isinstance(a, EpochKey), a
     assert isinstance(b, EpochKey), b
     assert a.gear == b.gear == gear
-    assert a.key == b.key and len(a.key) == 32
+    assert a.alice_to_bob == b.alice_to_bob and a.bob_to_alice == b.bob_to_alice
+    assert len(a.alice_to_bob) == 32 and a.alice_to_bob != a.bob_to_alice
 
 
 def test_healthy_channel_gear3(lab):
     a, b = run_epoch(lab)
     agree(a, b, 3)
-    assert open_sealed(b, seal(a, 1, "hello")) == "hello"
+    assert open_sealed(b, seal(a, "alice", 1, "hello"), "alice") == "hello"
+    assert open_sealed(a, seal(b, "bob", 1, "hi back"), "bob") == "hi back"
 
 
 def test_eve_forces_gear2(lab):
@@ -86,4 +88,4 @@ def test_old_epoch_message_rejected(lab):
     k1, _ = run_epoch(lab, 1)
     _, k2 = run_epoch(lab, 2)
     with pytest.raises(ValueError):
-        open_sealed(k2, seal(k1, 1, "replayed from epoch 1"))
+        open_sealed(k2, seal(k1, "alice", 1, "replayed from epoch 1"), "alice")

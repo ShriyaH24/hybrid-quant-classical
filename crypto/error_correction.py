@@ -23,6 +23,11 @@ from typing import Callable, List, Sequence, Tuple
 
 import numpy as np
 
+# Stop reconciling once this share of the key has been revealed as parities:
+# beyond it nothing secret is left, and it bounds the work an inconsistent
+# (faulty or malicious) peer can force on Alice.
+MAX_LEAK_FRACTION = 0.75
+
 # (pass_index, start, end) on the permuted key -> parity bit
 Query = Tuple[int, int, int]
 ParityOracle = Callable[[List[Query]], List[int]]
@@ -50,6 +55,26 @@ def range_parity(key: Sequence[int], perm: Sequence[int], start: int, end: int) 
     for i in range(start, end):
         p ^= key[perm[i]]
     return p
+
+
+def validate_queries(raw, n: int, passes: int) -> List[Query]:
+    """
+    Bob's side: check every parity query before answering it. A query is
+    (pass, start, end) with 0 <= pass < passes and 0 <= start < end <= n.
+    Anything else (wrong shape, out of range, empty range) aborts the epoch
+    instead of crashing Bob or answering about bits that do not exist.
+    """
+    if not isinstance(raw, list) or len(raw) > 4 * n + 16:
+        raise ValueError("parity request has the wrong shape")
+    out = []
+    for q in raw:
+        if not (isinstance(q, (list, tuple)) and len(q) == 3 and all(isinstance(v, int) for v in q)):
+            raise ValueError(f"malformed parity query {q!r}")
+        p, s, e = q
+        if not (0 <= p < passes and 0 <= s < e <= n):
+            raise ValueError(f"parity query out of range {q!r}")
+        out.append((p, s, e))
+    return out
 
 
 def answer_queries(key: Sequence[int], perms: List[List[int]], queries: List[Query]) -> List[int]:
@@ -121,6 +146,15 @@ def reconcile(alice_key: Sequence[int],
         s, e = block_range(p, b)
         return range_parity(key, perms[p], s, e) != bob_blocks[p][b]
 
+    # Termination guard. With honest answers Cascade always ends, but if Bob's
+    # parities are inconsistent (a faulty peer, a tampered PARITY_RESPONSE, a
+    # seed mismatch) the backtracking can cycle forever. Past this budget no
+    # secret key could survive anyway (privacy amplification subtracts every
+    # revealed parity), so stop and let the verification tag reject the key.
+    max_leak = int(MAX_LEAK_FRACTION * n) + 64
+    max_rounds = 4 * n + 64
+    rounds = 0
+
     for p in range(len(perms)):
         count = (n + sizes[p] - 1) // sizes[p]
         bob_blocks.append(ask([(p, *block_range(p, b)) for b in range(count)]))
@@ -128,6 +162,9 @@ def reconcile(alice_key: Sequence[int],
 
         odd = {(p, b) for b in range(count) if is_odd(p, b)}
         while odd:
+            rounds += 1
+            if leaked > max_leak or rounds > max_rounds:
+                return key, leaked, corrections
             ranges = [(q, *block_range(q, b)) for q, b in sorted(odd)]
             errors, used = _bisect_all(key, perms, ranges, ask)
             leaked += used
