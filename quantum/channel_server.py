@@ -100,9 +100,10 @@ class ChannelServer:
 
     def _on_send(self, conn, p):
         if not self.channel.link_up:
-            self.log("Alice tried to send photons, but the quantum link is DOWN")
-            send_packet(conn, MessageType.Q_ERROR, {"reason": "quantum link is down"})
-            return
+            if self.show_probes or not self._down_reported:
+                self.log("Alice is trying to send photons, but the quantum link is DOWN"
+                         + ("" if self.show_probes else "  (repeats hidden - 'watch on' to see them)"))
+                self._down_reported = True
         with self.lock:
             now = time.time()
             self.pending = {k: v for k, v in self.pending.items() if now - v[2] < SESSION_TTL}
@@ -125,6 +126,7 @@ class ChannelServer:
         eve = " | EVE INTERCEPTED every photon" if st.eve_active else ""
         kind = "probe" if st.photons <= 2048 else "epoch"
         if kind == "epoch" or self.show_probes:
+            self._down_reported = False  # "link is DOWN" is shown once, not every probe
             self.log(f"{kind}: {st.photons} photons | true sifted error rate "
                      f"{st.true_qber:.2%} (noise setting {self.channel.noise:.2%}){eve}")
         send_packet(conn, MessageType.Q_RESULT, {"bits": bob_bits})
@@ -163,6 +165,7 @@ def console(server: ChannelServer, tap=None):
             ch.link_up = False
         elif cmd == ["link", "up"]:
             ch.link_up = True
+            server._down_reported = False
         elif cmd == ["watch", "on"]:
             server.show_probes = True
         elif cmd == ["watch", "off"]:

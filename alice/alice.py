@@ -26,6 +26,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -77,7 +78,8 @@ class AliceNode(Node):
                         pass
                 return False
             finally:
-                self.out(self.prompt())
+                if threading.current_thread() is not threading.main_thread():
+                    self.out(self.prompt())          # redraw the prompt the monitor interrupted
 
     def rotate_if_due(self) -> None:
         if self.rotation_due.is_set():
@@ -109,10 +111,23 @@ def main():
                       pqc_enabled=not a.no_pqc, qubits=a.qubits)
 
     client = Client(a.host, a.port)
-    client.connect()
+    try:
+        client.connect()
+    except OSError as exc:
+        print(f"\n[ALICE] cannot connect to {a.host}:{a.port} ({exc}).\n"
+              f"        Is Bob (or Eve's tap) running, is the IP right, and is the firewall open?")
+        return
     node = AliceNode(client.socket, ctx, a.rekey_every, out=lambda m: print(m, end="" if m.endswith("> ") else "\n", flush=True))
     node.start_reader()
-    node.rekey("session start")
+    try:
+        node.rekey("session start")
+    except (ConnectionError, OSError):
+        print(f"\n[ALICE] the connection to {a.host}:{a.port} was closed before the first key exchange.\n"
+              f"        If you connect through Eve's tap: Eve's laptop could not reach Bob - look at Eve's\n"
+              f"        window, check Bob is running with --host 0.0.0.0, --tap-to has Bob's IP, and Bob's\n"
+              f"        firewall allows port 5000. Then restart Bob first, then Alice.")
+        node.closed.set()
+        return
 
     monitor = None
     if a.probe_every > 0:
